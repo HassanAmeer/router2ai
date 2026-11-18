@@ -1,0 +1,290 @@
+package models
+
+import (
+	json "encoding/json/v2"
+	"strings"
+)
+
+// Meta represents a key-value meta record.
+type Meta struct {
+	Key   string `json:"key"`
+	Value string `json:"value"`
+}
+
+// Setting represents a single settings record.
+type Setting struct {
+	ID   int    `json:"id"`
+	Data string `json:"data"` // JSON string representation of the settings data
+}
+
+// ProviderConnection represents an upstream provider connection.
+type ProviderConnection struct {
+	ID       string  `json:"id"`
+	Provider string  `json:"provider"`
+	AuthType string  `json:"authType"`
+	Name     *string `json:"name,omitempty"`
+	Email    *string `json:"email,omitempty"`
+	Priority *int    `json:"priority,omitempty"`
+	IsActive int     `json:"isActive"` // 0 or 1
+	Data     string  `json:"data"`     // JSON string representing additional provider config
+	// LastUsedAt / ConsecutiveUseCount back persistent round-robin. Upstream
+	// keeps no in-memory rotation index: it sorts candidates by lastUsedAt and
+	// writes the winner's stamp back (src/sse/services/auth.js:154-189), so the
+	// rotation survives a restart and behaves the same in every process.
+	LastUsedAt          *string `json:"lastUsedAt,omitempty"`
+	ConsecutiveUseCount *int    `json:"consecutiveUseCount,omitempty"`
+	CreatedAt           string  `json:"createdAt"`
+	UpdatedAt           string  `json:"updatedAt"`
+}
+
+// ProviderNode represents a deployment node / executor config.
+type ProviderNode struct {
+	ID        string  `json:"id"`
+	Type      *string `json:"type,omitempty"`
+	Name      *string `json:"name,omitempty"`
+	Data      string  `json:"data"` // JSON string representing node details
+	CreatedAt string  `json:"createdAt"`
+	UpdatedAt string  `json:"updatedAt"`
+}
+
+// IsMediaActive reports whether the connection is active and eligible for media routing.
+// When serviceKind is provided, it also checks against disabledKinds.
+// Defaults to true when unspecified for backward compatibility.
+func (c *ProviderConnection) IsMediaActive(serviceKind ...string) bool {
+	if c == nil || c.IsActive != 1 {
+		return false
+	}
+	return IsConnectionMediaActive(c.Data, serviceKind...)
+}
+
+// IsMediaActive reports whether the provider node is eligible for media routing.
+// Defaults to true when unspecified for backward compatibility.
+func (n *ProviderNode) IsMediaActive(serviceKind ...string) bool {
+	if n == nil {
+		return false
+	}
+	return IsConnectionMediaActive(n.Data, serviceKind...)
+}
+
+// IsConnectionMediaActive reports whether a connection payload permits media routing.
+// When serviceKind is provided, it also checks against disabledKinds.
+// Returns false if mediaEnabled or isMediaActive is explicitly false, or if
+// disabledKinds contains the requested serviceKind or "media".
+// Defaults to true for backward compatibility.
+func IsConnectionMediaActive(dataJSON string, serviceKind ...string) bool {
+	if strings.TrimSpace(dataJSON) == "" {
+		return true
+	}
+	var data map[string]any
+	if err := json.Unmarshal([]byte(dataJSON), &data); err != nil || data == nil {
+		return true
+	}
+
+	// 1. Check top-level mediaEnabled
+	if v, ok := data["mediaEnabled"]; ok {
+		if b, isBool := parseMediaBool(v); isBool && !b {
+			return false
+		}
+	}
+	// 2. Check top-level isMediaActive
+	if v, ok := data["isMediaActive"]; ok {
+		if b, isBool := parseMediaBool(v); isBool && !b {
+			return false
+		}
+	}
+
+	kind := ""
+	if len(serviceKind) > 0 {
+		kind = strings.TrimSpace(serviceKind[0])
+	}
+
+	// 3. Check top-level disabledKinds
+	if isKindDisabled(data["disabledKinds"], kind) {
+		return false
+	}
+
+	// 4. Check nested providerSpecificData
+	if psd, ok := data["providerSpecificData"].(map[string]any); ok && psd != nil {
+		if v, ok := psd["mediaEnabled"]; ok {
+			if b, isBool := parseMediaBool(v); isBool && !b {
+				return false
+			}
+		}
+		if v, ok := psd["isMediaActive"]; ok {
+			if b, isBool := parseMediaBool(v); isBool && !b {
+				return false
+			}
+		}
+		if isKindDisabled(psd["disabledKinds"], kind) {
+			return false
+		}
+	}
+
+	return true
+}
+
+func parseMediaBool(v any) (val bool, ok bool) {
+	switch b := v.(type) {
+	case bool:
+		return b, true
+	case float64:
+		return b != 0, true
+	case int:
+		return b != 0, true
+	case string:
+		s := strings.ToLower(strings.TrimSpace(b))
+		if s == "false" || s == "0" {
+			return false, true
+		}
+		if s == "true" || s == "1" {
+			return true, true
+		}
+	}
+	return false, false
+}
+
+func isKindDisabled(v any, kind string) bool {
+	if v == nil {
+		return false
+	}
+	var kinds []string
+	switch arr := v.(type) {
+	case []string:
+		kinds = arr
+	case []any:
+		for _, item := range arr {
+			if s, ok := item.(string); ok {
+				kinds = append(kinds, s)
+			}
+		}
+	}
+	for _, k := range kinds {
+		if k == "media" {
+			return true
+		}
+		if kind != "" && k == kind {
+			return true
+		}
+	}
+	return false
+}
+
+// ProxyPool represents a pool of proxies.
+type ProxyPool struct {
+	ID         string  `json:"id"`
+	IsActive   int     `json:"isActive"` // 0 or 1
+	TestStatus *string `json:"testStatus,omitempty"`
+	Data       string  `json:"data"` // JSON string representing proxy credentials and checks
+	CreatedAt  string  `json:"createdAt"`
+	UpdatedAt  string  `json:"updatedAt"`
+}
+
+// APIKey represents a client-facing authorization key.
+type APIKey struct {
+	ID        string  `json:"id"`
+	Key       string  `json:"key"`
+	Name      *string `json:"name,omitempty"`
+	MachineID *string `json:"machineId,omitempty"`
+	IsActive  int     `json:"isActive"` // 0 or 1
+	CreatedAt string  `json:"createdAt"`
+	// F-1 Rate Limiting
+	RateLimitRPM         *int `json:"rateLimitRpm,omitempty"`
+	RateLimitTPM         *int `json:"rateLimitTpm,omitempty"`
+	RateLimitConcurrency *int `json:"rateLimitConcurrency,omitempty"`
+	// F-1b Budget & queue. TokenQuota caps the key's cumulative
+	// prompt+completion tokens across its lifetime (0 = unlimited).
+	// QueueTimeoutMs is how long a request waits for a free concurrency slot
+	// before it is refused; 0 falls back to the server default.
+	TokenQuota     *int `json:"tokenQuota,omitempty"`
+	QueueTimeoutMs *int `json:"queueTimeoutMs,omitempty"`
+	// ContextLimit caps the context window a single request from this key may
+	// use, in tokens. 0 means the model's own window applies. It bounds one
+	// request, where TokenQuota bounds what the key may spend over its life.
+	ContextLimit *int `json:"contextLimit,omitempty"`
+	// F-6 Argon2id hashing
+	KeyHash    *string `json:"keyHash,omitempty"`
+	LookupHash *string `json:"lookupHash,omitempty"`
+	KeyDisplay *string `json:"keyDisplay,omitempty"`
+	// F-14 Time-limit + resale metadata
+	ExpiresAt  *string `json:"expiresAt,omitempty"`
+	LastUsedAt *string `json:"lastUsedAt,omitempty"`
+	UsedCount  *int    `json:"usedCount,omitempty"`
+	Metadata   *string `json:"metadata,omitempty"`
+	// F-3 Plans: id of the reusable policy template this key inherits from.
+	// Empty means no plan; plan values are defaults the key can override.
+	PlanID *string `json:"planId,omitempty"`
+	// F-2 Budget: per-period spend ceiling. LimitMicros is USD micros and
+	// LimitTokens is prompt+completion tokens, both measured over BudgetPeriod
+	// (daily|weekly|monthly|total). AlertPct is the spend percentage at which
+	// a warning header is raised and HardCutoff refuses with 402 once the
+	// period budget is spent. 0/"" means "not set", which leaves the plan's
+	// value in charge.
+	LimitMicros  int64  `json:"limitMicros,omitempty"`
+	LimitTokens  int64  `json:"limitTokens,omitempty"`
+	BudgetPeriod string `json:"budgetPeriod,omitempty"`
+	AlertPct     int    `json:"alertPct,omitempty"`
+	HardCutoff   bool   `json:"hardCutoff,omitempty"`
+}
+
+// Combo represents a multi-model routing combinated alias.
+type Combo struct {
+	ID        string  `json:"id"`
+	Name      string  `json:"name"`
+	Kind      *string `json:"kind,omitempty"`
+	Models    string  `json:"models"`   // JSON string representing model selection details
+	Strategy  string  `json:"strategy"` // routing strategy: "fallback", "round-robin", "capacity", "fusion"
+	CreatedAt string  `json:"createdAt"`
+	UpdatedAt string  `json:"updatedAt"`
+	// MatchRules is the raw JSON of the combo's smart rules. Empty means the
+	// combo has none, which is every combo written before the feature.
+	MatchRules string `json:"matchRules,omitempty"`
+	// CustomPrompt is the combo's own system prompt. When set it overrides the
+	// global custom prompt for requests routed through this combo. Empty means
+	// unset, in which case the global system prompt prefix/suffix applies.
+	CustomPrompt string `json:"customPrompt,omitempty"`
+	// AutoMembers is derived, never stored: the models the rules currently
+	// own. The dashboard badges them so an operator can tell a managed member
+	// from one they pinned by hand.
+	AutoMembers []string `json:"autoMembers,omitempty"`
+}
+
+// KV represents a scoped key-value store entry.
+type KV struct {
+	Scope string `json:"scope"`
+	Key   string `json:"key"`
+	Value string `json:"value"`
+}
+
+// UsageHistory represents logged usage metrics for a request.
+type UsageHistory struct {
+	ID               int64   `json:"id"`
+	Timestamp        string  `json:"timestamp"`
+	Provider         *string `json:"provider,omitempty"`
+	Model            *string `json:"model,omitempty"`
+	ConnectionID     *string `json:"connectionId,omitempty"`
+	APIKey           *string `json:"apiKey,omitempty"`
+	Endpoint         *string `json:"endpoint,omitempty"`
+	PromptTokens     int     `json:"promptTokens"`
+	CompletionTokens int     `json:"completionTokens"`
+	Cost             float64 `json:"cost"`
+	Status           *string `json:"status,omitempty"`
+	Tokens           *string `json:"tokens,omitempty"` // JSON metadata on pricing / raw details
+	Meta             *string `json:"meta,omitempty"`   // Extra metadata JSON
+}
+
+// UsageDaily represents aggregated usage per day.
+type UsageDaily struct {
+	DateKey string `json:"dateKey"`
+	Data    string `json:"data"` // JSON string representing daily stats details
+}
+
+// RequestDetail represents the cached payload/response logs of requests.
+type RequestDetail struct {
+	ID           string  `json:"id"`
+	Timestamp    string  `json:"timestamp"`
+	Provider     *string `json:"provider,omitempty"`
+	Model        *string `json:"model,omitempty"`
+	ConnectionID *string `json:"connectionId,omitempty"`
+	Status       *string `json:"status,omitempty"`
+	Data         string  `json:"data"` // JSON representation of request/response payload
+}

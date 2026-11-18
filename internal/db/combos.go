@@ -1,0 +1,220 @@
+package db
+
+import (
+	"database/sql"
+	json "encoding/json/v2"
+	"errors"
+	"fmt"
+	"strings"
+
+	"9router/proxy/internal/models"
+)
+
+// comboColumns is the shared column list for every combos read.
+const comboColumns = `id, name, kind, models, customPrompt, createdAt, updatedAt`
+
+// defaultComboStrategy is what a combo gets when neither a per-combo override
+// nor the global setting names one.
+const defaultComboStrategy = "fallback"
+
+// scanCombo fills a combo from a row shaped like comboColumns.
+func scanCombo(scan func(dest ...any) error, combo *models.Combo) error {
+	return scan(&combo.ID, &combo.Name, &combo.Kind, &combo.Models, &combo.CustomPrompt, &combo.CreatedAt, &combo.UpdatedAt)
+}
+
+// resolveComboStrategy picks the strategy for one combo: a per-combo override
+// wins, then the global default, then "fallback". A nil settings read (no
+// settings row yet) leaves the fallback in place rather than failing the read.
+func resolveComboStrategy(combo *models.Combo, s *SettingsData) {
+	combo.Strategy = defaultComboStrategy
+	if s == nil {
+		return
+	}
+	if cs, ok := s.ComboStrategies[combo.Name]; ok && cs.Strategy != "" {
+		combo.Strategy = cs.Strategy
+		return
+	}
+	if s.ComboStrategy != "" {
+		combo.Strategy = s.ComboStrategy
+	}
+}
+
+// GetComboByName retrieves a combo configuration by its name.
+func (r *Repo) GetComboByName(name string) (*models.Combo, error) {
+	var combo models.Combo
+	err := scanCombo(r.db.QueryRow(
+		"SELECT "+comboColumns+" FROM combos WHERE name = ? LIMIT 1",
+		name,
+	).Scan, &combo)
+
+	if err == sql.ErrNoRows {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	settings, _ := r.GetSettings()
+	resolveComboStrategy(&combo, settings)
+	return &combo, nil
+}
+
+// GetComboById retrieves a combo configuration by its ID.
+func (r *Repo) GetComboById(id string) (*models.Combo, error) {
+	var combo models.Combo
+	err := scanCombo(r.db.QueryRow(
+		"SELECT "+comboColumns+" FROM combos WHERE id = ? LIMIT 1",
+		id,
+	).Scan, &combo)
+
+	if err == sql.ErrNoRows {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	settings, _ := r.GetSettings()
+	resolveComboStrategy(&combo, settings)
+	return &combo, nil
+}
+
+// GetCombos retrieves all combos from the database.
+//
+// Ordering is the operator-arranged order from the dashboard (sortOrder),
+// falling back to createdAt for every row written before the reorder feature
+// existed (all sortOrder 0, so the legacy order is preserved exactly).
+func (r *Repo) GetCombos() ([]*models.Combo, error) {
+	rows, err := r.db.Query("SELECT " + comboColumns + " FROM combos ORDER BY sortOrder ASC, createdAt ASC")
+	if err != nil {
+		return nil, err
+	}
+	// Drain and close the rows BEFORE reading settings: holding an open rows set
+	// occupies one pooled connection (MaxOpenConns is 4), so a nested query
+	// here could deadlock the whole pool once four concurrent callers pile up.
+	var combos []*models.Combo
+	for rows.Next() {
+		var combo models.Combo
+		if err := scanCombo(rows.Scan, &combo); err != nil {
+			rows.Close()
+			return nil, err
+		}
+		combos = append(combos, &combo)
+	}
+	if err = rows.Err(); err != nil {
+		rows.Close()
+		return nil, err
+	}
+	rows.Close()
+
+	settings, _ := r.GetSettings()
+
+	// Strategy resolution runs after the rows are closed so the nested settings
+	// read can never hold two pooled connections at once.
+	for _, combo := range combos {
+		resolveComboStrategy(combo, settings)
+	}
+	return combos, nil
+}
+
+// ParseComboModels parses a combo's Models JSON string into a list of models.ComboModel.
+// Supports both string arrays and object arrays. Models without an explicit weight default to 1.
+// ErrComboReorderInvalid marks validation failures in ReorderCombos (unknown,
+// duplicate or missing ids) so handlers can answer 400 instead of 500.
+var ErrComboReorderInvalid = errors.New("invalid combo reorder")
+
+// ReorderCombos persists the dashboard drag-to-reorder order (cheaprouter
+// parity: POST /api/combos/reorder). ids are the full combo set in the order
+// the operator arranged; every id is assigned its 1-based position and the
+// write lands in one transaction so a failure leaves the previous order
+// untouched. Fails before writing anything when the input is not exactly the
+// current combo set — a stale client must not half-apply a partial order.
+func (r *Repo) ReorderCombos(ids []string) ([]*models.Combo, error) {
+	if len(ids) == 0 {
+		return nil, fmt.Errorf("%w: empty id list", ErrComboReorderInvalid)
+	}
+	current, err := r.GetCombos()
+	if err != nil {
+		return nil, err
+	}
+	have := make(map[string]struct{}, len(current))
+	for _, combo := range current {
+		have[combo.ID] = struct{}{}
+	}
+	seen := make(map[string]struct{}, len(ids))
+	for _, id := range ids {
+		if _, ok := have[id]; !ok {
+			return nil, fmt.Errorf("%w: unknown combo %q", ErrComboReorderInvalid, id)
+		}
+		if _, dup := seen[id]; dup {
+			return nil, fmt.Errorf("%w: duplicate combo %q", ErrComboReorderInvalid, id)
+		}
+		seen[id] = struct{}{}
+	}
+	for _, combo := range current {
+		if _, ok := seen[combo.ID]; !ok {
+			return nil, fmt.Errorf("%w: missing combo %q in new order", ErrComboReorderInvalid, combo.ID)
+		}
+	}
+
+	tx, err := r.db.Begin()
+	if err != nil {
+		return nil, fmt.Errorf("reorder combos: begin: %w", err)
+	}
+	defer tx.Rollback()
+	for i, id := range ids {
+		if _, err := tx.Exec(`UPDATE combos SET sortOrder = ? WHERE id = ?`, i+1, id); err != nil {
+			return nil, fmt.Errorf("reorder combos: %w", err)
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return nil, fmt.Errorf("reorder combos: commit: %w", err)
+	}
+	return r.GetCombos()
+}
+
+func ParseComboModels(modelsJSON string) ([]models.ComboModel, error) {
+	if strings.TrimSpace(modelsJSON) == "" {
+		return nil, nil
+	}
+	var cms []models.ComboModel
+	if err := json.Unmarshal([]byte(modelsJSON), &cms); err != nil {
+		return nil, err
+	}
+	return cms, nil
+}
+
+// ParseComboModelNames parses a combo's Models JSON string and returns just the model name strings.
+func ParseComboModelNames(modelsJSON string) ([]string, error) {
+	cms, err := ParseComboModels(modelsJSON)
+	if err != nil {
+		return nil, err
+	}
+	names := make([]string, len(cms))
+	for i, m := range cms {
+		names[i] = m.Model
+	}
+	return names, nil
+}
+
+// ParseComboModelWeights parses a combo's Models JSON string and returns a map of model name to weight.
+func ParseComboModelWeights(modelsJSON string) (map[string]int, error) {
+	cms, err := ParseComboModels(modelsJSON)
+	if err != nil {
+		return nil, err
+	}
+	weights := make(map[string]int, len(cms))
+	for _, m := range cms {
+		if m.Model != "" {
+			weights[m.Model] = m.Weight
+		}
+	}
+	return weights, nil
+}
+
+// GetComboModels retrieves a combo by name and returns its parsed models with weights.
+func (r *Repo) GetComboModels(name string) ([]models.ComboModel, error) {
+	combo, err := r.GetComboByName(name)
+	if err != nil || combo == nil {
+		return nil, err
+	}
+	return ParseComboModels(combo.Models)
+}

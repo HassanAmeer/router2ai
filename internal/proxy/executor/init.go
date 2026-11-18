@@ -1,0 +1,153 @@
+package executor
+
+// RegisterAll registers all known executor factories.
+// Called once at init or server startup.
+func RegisterAll() {
+	Register("openai", func() Executor { return ForwardOpenAI })
+	Register("anthropic", func() Executor { return ForwardOpenAI })
+	Register("tokenharbor", func() Executor { return ForwardOpenAI })
+	Register("dahl", func() Executor { return ForwardOpenAI })
+	Register("bai", func() Executor { return ForwardOpenAI })
+	Register("atria", func() Executor { return ForwardOpenAI })
+	Register("agnes", func() Executor { return ForwardOpenAI })
+	Register("deepseek", func() Executor { return ForwardOpenAI })
+	Register("sumopod", func() Executor { return ForwardOpenAI })
+	Register("groq", func() Executor { return ForwardOpenAI })
+	Register("nvidia", func() Executor { return ForwardNvidia })
+	Register("openrouter", func() Executor { return ForwardOpenAI })
+	Register("cerebras", func() Executor { return ForwardOpenAI })
+	Register("together", func() Executor { return ForwardOpenAI })
+	Register("fireworks", func() Executor { return ForwardOpenAI })
+	Register("opencode", func() Executor { return ForwardOpencode })
+	Register("gemini", func() Executor { return ForwardOpenAI })
+	Register("github", func() Executor { return ForwardGithub })
+	Register("mistral", func() Executor { return ForwardOpenAI })
+	Register("perplexity", func() Executor { return ForwardOpenAI })
+	Register("xai", func() Executor { return ForwardOpenAI })
+	Register("cohere", func() Executor { return ForwardOpenAI })
+	Register("ollama", func() Executor { return ForwardOpenAI })
+	Register("siliconflow", func() Executor { return ForwardOpenAI })
+	Register("cloudflare-ai", func() Executor { return ForwardOpenAI })
+	Register("blackbox", func() Executor { return ForwardOpenAI })
+	Register("featherless", func() Executor { return ForwardOpenAI })
+	Register("hyperbolic", func() Executor { return ForwardOpenAI })
+	Register("kilocode", func() Executor { return ForwardOpenAI })
+	Register("nanobanana", func() Executor { return ForwardOpenAI })
+	Register("opencode-go", func() Executor { return ForwardOpencodeGo })
+	Register("opencode-zen", func() Executor { return ForwardOpencodeZen })
+	Register("vercel-ai-gateway", func() Executor { return ForwardOpenAI })
+	Register("volcengine-ark", func() Executor { return ForwardOpenAI })
+	Register("xiaomi-mimo", func() Executor { return ForwardOpenAI })
+	Register("xiaomi-tokenplan", func() Executor { return ForwardOpenAI })
+	Register("chutes", func() Executor { return ForwardOpenAI })
+	Register("cline", func() Executor { return ForwardOpenAI })
+	Register("alicode", func() Executor { return ForwardOpenAI })
+	Register("alicode-intl", func() Executor { return ForwardOpenAI })
+	Register("byteplus", func() Executor { return ForwardOpenAI })
+	Register("codebuddy-cn", func() Executor { return ForwardCodebuddyCNWithTelemetry })
+	Register("codebuddy-intl", func() Executor { return ForwardCodebuddyCN })
+	Register("gitlab", func() Executor { return ForwardOpenAI })
+	Register("glm-cn", func() Executor { return ForwardZai })
+	Register("glm", func() Executor { return ForwardZai })
+	Register("zcode", func() Executor { return ForwardZcode })
+	Register("nebius", func() Executor { return ForwardOpenAI })
+	Register("minimax", func() Executor { return ForwardOpenAI })
+	Register("kimi", func() Executor { return ForwardKimi })
+	Register("clinepass", func() Executor { return ForwardOpenAI })
+	Register("ollama-local", func() Executor { return ForwardOpenAI })
+	Register("minimax-cn", func() Executor { return ForwardOpenAI })
+	Register("muse", func() Executor { return ForwardMuse })
+	Register("kimi-coding", func() Executor { return ForwardKimi })
+	Register("claude", func() Executor { return ForwardOpenAI })
+	Register("perplexity-agent", func() Executor { return ForwardCodex })
+	Register("codex", func() Executor { return ForwardCodex })
+	Register("grok-cli", func() Executor { return ForwardGrokCLI })
+	Register("iflow", func() Executor { return ForwardIflow })
+	Register("kimchi", func() Executor { return ForwardKimchi })
+	Register("kiro", func() Executor { return ForwardKiro })
+	// deepseek-web authenticates with a browser-login userToken exchanged for a
+	// short-lived access token, and gates every completion on a proof of work, so
+	// it needs the full executor rather than the shared passthrough.
+	Register("deepseek-web", func() Executor { return ForwardDeepSeekWeb })
+	// gemini-web talks to gemini.google.com over plain HTTP. It is not an API,
+	// but the site answers an anonymous client, so it needs the full executor —
+	// the session tokens, the nested request array and the line stream are not
+	// anything the shared passthrough can express.
+	Register("gemini-web", func() Executor { return ForwardGeminiWeb })
+	// grok-web posts to grok.com's conversations/new behind Cloudflare with a
+	// browser Cookie header and answers NDJSON, not an OpenAI stream — the
+	// shared passthrough cannot express the handshake or the wire shape.
+	Register("grok-web", func() Executor { return ForwardGrokWeb })
+	// One executor serves both Bedrock entries: the registry entry's Format picks the
+	// wire shape (Anthropic Messages vs OpenAI Chat Completions), the way one Vertex
+	// executor serves vertex and vertex-partner.
+	Register("bedrock", func() Executor { return ForwardBedrock })
+	Register("bedrock-xai", func() Executor { return ForwardBedrock })
+	Register("azure", func() Executor { return ForwardAzure })
+	Register("commandcode", func() Executor { return ForwardCommandcode })
+	// The documented Provider API surface: three lanes on one bearer, the lane
+	// chosen per model from the live catalogue's supported_endpoints.
+	Register("commandcode-goat", func() Executor { return ForwardCommandcodeGoat })
+	Register("qoder", func() Executor { return ForwardQoder })
+	Register("qoder-cn", func() Executor { return ForwardQoder })
+	Register("alims-intl", func() Executor { return ForwardOpenAI })
+	Register("api-airforce", func() Executor { return ForwardOpenAI })
+	Register("baidu", func() Executor { return ForwardOpenAI })
+	Register("bazaarlink", func() Executor { return ForwardOpenAI })
+	Register("bluesminds", func() Executor { return ForwardOpenAI })
+	Register("devin-cli", func() Executor { return ForwardOpenAI })
+	// Vertex AI: the registry entries carried no executor, so every request
+	// POSTed an OpenAI body at aiplatform.googleapis.com, which serves neither
+	// lane. Both provider ids share one implementation — the difference is the
+	// URL shape, decided inside from the provider id.
+	Register("vertex", func() Executor { return ForwardVertex })
+	Register("vertex-partner", func() Executor { return ForwardVertex })
+	// Perplexity Web is not OpenAI-compatible in either direction: the request
+	// is a query_str envelope and the answer is Perplexity's own event stream,
+	// so the passthrough cannot serve it.
+	Register("perplexity-web", func() Executor { return ForwardPerplexityWeb })
+	// venice.ai and v0.dev speak a cookie-gated near-OpenAI chat lane (one JSON
+	// body or SSE chunks); the passthrough cannot attach the browser Cookie or
+	// flatten the transcript.
+	Register("venice-web", func() Executor { return ForwardVeniceWeb })
+	Register("v0-vercel-web", func() Executor { return ForwardV0VercelWeb })
+	// poe.com answers a GraphQL ChatViewQuery with one message object; the
+	// passthrough has no way to express it.
+	Register("poe-web", func() Executor { return ForwardPoeWeb })
+	// aistudio.tencent.ai answers on an internal non-OpenAI lane keyed by
+	// Hunyuan codename; the passthrough has no way to express it.
+	Register("tencent-aistudio-web", func() Executor { return ForwardTencentAIStudioWeb })
+	// zenmux.ai's free tier is an Anthropic-compatible SSE lane that reads a
+	// ctoken from the query string; the passthrough has no way to express it
+	// or to re-frame the stream as OpenAI chunks.
+	Register("zenmux-free", func() Executor { return ForwardZenmuxFree })
+	// Web & cookie providers catalogued from the cheaprouter port whose Go
+	// executors are not ported yet: visible in the dashboard, but answered
+	// with a clear 503 rather than silently replayed against the wrong lane.
+	for _, pending := range webCookiePendingProviders {
+		provider := pending
+		Register(provider, func() Executor { return ForwardWebCookiePending(provider) })
+	}
+	Register("freebuff", func() Executor { return ForwardFreebuff })
+	// free-pi cannot ride the shared passthrough: it must set two per-account
+	// headers (x-session-id, x-client-version) that the registry's static map
+	// cannot carry, and it must inspect the upstream status so a 409
+	// concurrent_session stays a 409 instead of being written out as a 200
+	// carrying an error body.
+	Register("free-pi", func() Executor { return ForwardFreePi })
+	Register("kilo-gateway", func() Executor { return ForwardOpenAI })
+	Register("llm7", func() Executor { return ForwardOpenAI })
+	Register("morph", func() Executor { return ForwardOpenAI })
+	Register("poolside", func() Executor { return ForwardOpenAI })
+	Register("sambanova", func() Executor { return ForwardOpenAI })
+	Register("tencent", func() Executor { return ForwardOpenAI })
+	Register("tokenrouter", func() Executor { return ForwardOpenAI })
+	Register("trae", func() Executor { return ForwardTrae })
+	Register("windsurf", func() Executor { return ForwardWindsurf })
+	Register("zed", func() Executor { return ForwardZed })
+	Register("minimax-code", func() Executor { return ForwardMinimaxCode })
+	Register("minimax-code-global", func() Executor { return ForwardMinimaxCode })
+	Register("daoxe", func() Executor { return ForwardOpenAI })
+	Register("nan", func() Executor { return ForwardOpenAI })
+	Register("openadapter", func() Executor { return ForwardOpenAI })
+}

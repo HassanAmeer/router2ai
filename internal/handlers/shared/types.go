@@ -1,0 +1,301 @@
+package shared
+
+import (
+	"net/http"
+	"slices"
+	"strings"
+	"sync"
+	"time"
+
+	"9router/proxy/internal/proxy"
+)
+
+// ModelInfo holds the resolved provider and model identifiers.
+// ConnectionID, when set, pins a specific connection found during resolution
+// so getBestConnection can skip the DB lookup.
+// ComboModels, when non-empty, lists all "provider/model" entries from a combo.
+// The handler iterates through them on upstream failure.
+type ModelInfo struct {
+	Provider     string
+	Model        string
+	ConnectionID string   // optional — set when the resolver already found a connection
+	ComboModels  []string // non-empty when resolved from a combo; each entry is "provider/model"
+	Strategy     string   // combo routing strategy: "fallback", "round-robin", "sticky", "fusion"
+	StickyLimit  int      // sticky round-robin: consecutive requests per model before rotating (default 1)
+	JudgeModel   string   // optional judge model for fusion strategy
+}
+
+// ConnectionData holds parsed fields from the providerConnections.data JSON blob.
+type ConnectionData struct {
+	APIKey                 string         `json:"apiKey"`
+	AccessToken            string         `json:"accessToken"`
+	AuthType               string         `json:"authType"`
+	BaseURL                string         `json:"baseUrl,omitempty"`
+	ProxyPoolID            string         `json:"proxyPoolId,omitempty"`
+	ConnectionProxyEnabled bool           `json:"connectionProxyEnabled,omitempty"`
+	ConnectionProxyURL     string         `json:"connectionProxyUrl,omitempty"`
+	ConnectionNoProxy      string         `json:"connectionNoProxy,omitempty"`
+	StrictProxy            bool           `json:"strictProxy,omitempty"`
+	AllowPrivateNetworking bool           `json:"allowPrivateNetworking,omitempty"`
+	MediaEnabled           *bool          `json:"mediaEnabled,omitempty"`
+	IsMediaActiveField     *bool          `json:"isMediaActive,omitempty"`
+	DisabledKinds          []string       `json:"disabledKinds,omitempty"`
+	ProviderSpecificData   map[string]any `json:"providerSpecificData,omitempty"`
+
+	// ResolvedProxyPool is the egress label for this request's pool — the name an
+	// operator gave it in the dashboard ("Vercel Relay"). Filled in by the client
+	// resolver, which already looked the pool up, so a log line can name the pool
+	// instead of printing a UUID nobody recognises. Set per request rather than
+	// persisted, so a rename shows up in the next log line.
+	ResolvedProxyPool string `json:"-"`
+}
+
+// IsMediaActive reports whether the connection data permits media routing for the service kind.
+// Defaults to true when unspecified for backward compatibility.
+func (c *ConnectionData) IsMediaActive(serviceKind ...string) bool {
+	if c == nil {
+		return false
+	}
+	if c.MediaEnabled != nil && !*c.MediaEnabled {
+		return false
+	}
+	if c.IsMediaActiveField != nil && !*c.IsMediaActiveField {
+		return false
+	}
+	kind := ""
+	if len(serviceKind) > 0 {
+		kind = strings.TrimSpace(serviceKind[0])
+	}
+	if slices.Contains(c.DisabledKinds, "media") || (kind != "" && slices.Contains(c.DisabledKinds, kind)) {
+		return false
+	}
+	if c.ProviderSpecificData != nil {
+		if v, ok := c.ProviderSpecificData["mediaEnabled"]; ok {
+			if b, ok := v.(bool); ok && !b {
+				return false
+			}
+		}
+		if v, ok := c.ProviderSpecificData["isMediaActive"]; ok {
+			if b, ok := v.(bool); ok && !b {
+				return false
+			}
+		}
+		if dk, ok := c.ProviderSpecificData["disabledKinds"].([]string); ok {
+			if slices.Contains(dk, "media") || (kind != "" && slices.Contains(dk, kind)) {
+				return false
+			}
+		} else if dkRaw, ok := c.ProviderSpecificData["disabledKinds"].([]any); ok {
+			for _, item := range dkRaw {
+				if s, ok := item.(string); ok && (s == "media" || (kind != "" && s == kind)) {
+					return false
+				}
+			}
+		}
+	}
+	return true
+}
+
+// UsageLogInfo holds request context needed to log a usage record. ConnName and
+// ConnEmail identify the account that actually served the turn: with several
+// connections behind one provider, provider+model says nothing about which
+// key or subscription paid for it.
+type UsageLogInfo struct {
+	Provider       string
+	Model          string
+	ConnectionID   string
+	ConnName       string
+	ConnEmail      string
+	APIKey         string
+	APIKeyName     string
+	Endpoint       string
+	Protocol       string
+	RequestedModel string
+	ComboName      string
+	CacheSource    string
+	StartedAt      time.Time
+	// Egress is the proxy pool or relay a request left the host through, empty
+	// for a direct one. Without it the log cannot answer "did this turn use the
+	// proxy?", which is the first question asked whenever a provider's rate limit
+	// or block list is tied to an IP.
+	Egress string
+
+	// RTK token compression metrics
+	OriginalInputTokens   int
+	SavedTokens           int
+	SavedPercent          int
+	CompressionDurationMs int
+}
+
+// AccountLabel returns a human-readable account identifier (email, name, or connection ID).
+func (u *UsageLogInfo) AccountLabel() string {
+	if u.ConnEmail != "" {
+		return u.ConnEmail
+	}
+	if u.ConnName != "" {
+		return u.ConnName
+	}
+	if u.ConnectionID != "" {
+		return u.ConnectionID
+	}
+	return "Default"
+}
+
+// ConnIdentityKV returns the log key/value pairs naming the account behind a
+// request. A request with no stored connection (a no-auth provider dialled
+// directly) is reported as "Public / Direct" rather than as an empty field, so
+// a reader can always tell "which account" apart from "no account".
+func (u *UsageLogInfo) ConnIdentityKV() []any {
+	kv := make([]any, 0, 8)
+	if u.ConnectionID != "" {
+		kv = append(kv, "conn", u.ConnectionID)
+	}
+	if u.ConnName != "" {
+		kv = append(kv, "connName", u.ConnName)
+	}
+	if u.ConnEmail != "" {
+		kv = append(kv, "email", u.ConnEmail)
+	}
+	if u.Egress != "" {
+		kv = append(kv, "egress", u.Egress)
+	}
+	if len(kv) == 0 {
+		kv = append(kv, "account", "Public / Direct")
+	}
+	return kv
+}
+
+// ResponseCaptureMax is the maximum response content retained for token
+// estimation. Content beyond this is dropped — a huge upstream response must
+// not balloon per-request memory just to estimate tokens.
+const ResponseCaptureMax = 100_000
+
+// ResponseBuf is a size-capped buffer for captured response content.
+// It implements io.Writer and keeps only the first ResponseCaptureMax bytes.
+type ResponseBuf struct {
+	buf  []byte
+	done bool
+}
+
+// Write appends p up to the cap, dropping anything beyond it.
+func (b *ResponseBuf) Write(p []byte) (int, error) {
+	if b.done {
+		return len(p), nil
+	}
+	room := ResponseCaptureMax - len(b.buf)
+	if room <= 0 {
+		b.done = true
+		return len(p), nil
+	}
+	if len(p) > room {
+		b.buf = append(b.buf, p[:room]...)
+		b.done = true
+	} else {
+		b.buf = append(b.buf, p...)
+	}
+	return len(p), nil
+}
+
+// String returns the captured content.
+func (b *ResponseBuf) String() string {
+	return string(b.buf)
+}
+
+// Len returns the number of captured bytes.
+func (b *ResponseBuf) Len() int {
+	return len(b.buf)
+}
+
+// Bytes returns the captured slice.
+func (b *ResponseBuf) Bytes() []byte {
+	return b.buf
+}
+
+// Reset releases the accumulated buffer memory and resets the done flag.
+func (b *ResponseBuf) Reset() {
+	b.buf = nil
+	b.done = false
+}
+
+// StreamMetrics captures timing and content during a proxied stream.
+type StreamMetrics struct {
+	TTFT        int64       // ms from request start to first chunk
+	ResponseBuf ResponseBuf // accumulated response content (capped)
+
+	// Output generation rate metrics (streaming turns). OutputTokens counts
+	// output tokens captured in the streamed response buffer; FirstToken and
+	// LastToken bracket the streamed output; MaxGapMs is the widest gap between
+	// two consecutive streamed chunks, in milliseconds. All are logged in the
+	// stream summary without touching the SSE wire protocol.
+	OutputTokens int
+	FirstToken   time.Time
+	LastToken    time.Time
+	MaxGapMs     int64
+	mu           sync.Mutex
+}
+
+// NoteOutput records one streamed chunk arriving at now, updating the first
+// token time, last token time and the max inter-token gap. Safe for concurrent
+// callers; a nil receiver is a no-op.
+func (m *StreamMetrics) NoteOutput(now time.Time) {
+	if m == nil {
+		return
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.FirstToken.IsZero() {
+		m.FirstToken = now
+	} else if gap := now.Sub(m.LastToken).Milliseconds(); gap > m.MaxGapMs {
+		m.MaxGapMs = gap
+	}
+	m.LastToken = now
+}
+
+// ElapsedMs returns the ms from the first streamed chunk to the last, or zero
+// when nothing was streamed.
+func (m *StreamMetrics) ElapsedMs() int64 {
+	if m == nil {
+		return 0
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.elapsedMsLocked()
+}
+
+// TokPerSec returns output tokens per second of streamed generation, or zero
+// when nothing was streamed or no time elapsed.
+func (m *StreamMetrics) TokPerSec() float64 {
+	if m == nil {
+		return 0
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.OutputTokens == 0 {
+		return 0
+	}
+	if elapsed := m.elapsedMsLocked(); elapsed > 0 {
+		return float64(m.OutputTokens) / (float64(elapsed) / 1000)
+	}
+	return 0
+}
+
+// elapsedMsLocked is ElapsedMs with the lock already held.
+func (m *StreamMetrics) elapsedMsLocked() int64 {
+	if m.FirstToken.IsZero() || m.LastToken.IsZero() {
+		return 0
+	}
+	return m.LastToken.Sub(m.FirstToken).Milliseconds()
+}
+
+// UpstreamError is an alias for proxy.UpstreamError — retryable errors from upstream.
+type UpstreamError = proxy.UpstreamError
+
+// StatusWriter intercepts HTTP status code for logging.
+type StatusWriter struct {
+	http.ResponseWriter
+	Status int
+}
+
+func (w *StatusWriter) WriteHeader(status int) {
+	w.Status = status
+	w.ResponseWriter.WriteHeader(status)
+}

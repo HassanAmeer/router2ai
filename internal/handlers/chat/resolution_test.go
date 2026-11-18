@@ -1,0 +1,821 @@
+package chat
+
+import (
+	json "encoding/json/v2"
+	"fmt"
+	"testing"
+	"time"
+
+	"9router/proxy/internal/db"
+	"9router/proxy/internal/handlers/shared"
+)
+
+func TestNewChatHandler_DefaultsAllOff(t *testing.T) {
+	database, cleanup := setupChatTestDB(t)
+	defer cleanup()
+	repo := db.NewRepo(database)
+
+	h := NewChatHandler(repo)
+	if h.Repo != repo {
+		t.Error("expected Repo to be set")
+	}
+	if h.Client == nil {
+		t.Error("expected Client to be initialized")
+	}
+	if h.TokenSaver == nil {
+		t.Fatal("expected non-nil TokenSaver config")
+	}
+	if h.TokenSaver.RTKEnabled() || h.TokenSaver.CavemanEnabled() || h.TokenSaver.PonytailEnabled() {
+		t.Error("expected all token savers off by default")
+	}
+}
+
+func TestNewChatHandler_WithConfig(t *testing.T) {
+	database, cleanup := setupChatTestDB(t)
+	defer cleanup()
+	repo := db.NewRepo(database)
+
+	ts := shared.NewTokenSaverConfig(true, true, false)
+	h := NewChatHandler(repo, ts)
+	if !h.TokenSaver.RTKEnabled() || !h.TokenSaver.CavemanEnabled() {
+		t.Error("expected RTK and Caveman enabled")
+	}
+	if h.TokenSaver.PonytailEnabled() {
+		t.Error("expected Ponytail disabled")
+	}
+}
+
+func TestNewChatHandler_NilConfigIsAllOff(t *testing.T) {
+	database, cleanup := setupChatTestDB(t)
+	defer cleanup()
+	repo := db.NewRepo(database)
+
+	h := NewChatHandler(repo, nil)
+	if h.TokenSaver.RTKEnabled() {
+		t.Error("nil config should mean RTK off")
+	}
+}
+
+func TestResolveModelEntry_ValidProviderSlashModel(t *testing.T) {
+	database, cleanup := setupChatTestDB(t)
+	defer cleanup()
+	repo := db.NewRepo(database)
+	h := NewChatHandler(repo)
+
+	info := h.resolveModelEntry("deepseek/deepseek-chat")
+	if info == nil {
+		t.Fatal("expected non-nil ModelInfo")
+	}
+	if info.Provider != "deepseek" || info.Model != "deepseek-chat" {
+		t.Errorf("got %s/%s", info.Provider, info.Model)
+	}
+}
+
+func TestResolveModelEntry_NoSlashReturnsNil(t *testing.T) {
+	database, cleanup := setupChatTestDB(t)
+	defer cleanup()
+	repo := db.NewRepo(database)
+	h := NewChatHandler(repo)
+
+	// Non-existent combo name returns nil.
+	if info := h.resolveModelEntry("no-such-combo-name"); info != nil {
+		t.Errorf("expected nil for non-existent combo, got %+v", info)
+	}
+}
+
+func TestResolveModelEntry_NestedCombo(t *testing.T) {
+	database, cleanup := setupChatTestDB(t)
+	defer cleanup()
+	repo := db.NewRepo(database)
+	h := NewChatHandler(repo)
+
+	// Create inner combo: "inner-combo" → deepseek/deepseek-chat
+	innerModels, _ := json.Marshal([]string{"deepseek/deepseek-chat"})
+	database.Exec(`INSERT INTO combos (id, name, kind, models, createdAt, updatedAt) VALUES (?, ?, ?, ?, ?, ?)`,
+		"inner", "inner-combo", "fallback", string(innerModels), "2026-07-19T00:00:00Z", "2026-07-19T00:00:00Z")
+
+	// Create outer combo: "free-tier" → ["inner-combo", "deepseek/deepseek-chat"]
+	outerModels, _ := json.Marshal([]string{"inner-combo", "deepseek/deepseek-chat"})
+	database.Exec(`INSERT INTO combos (id, name, kind, models, createdAt, updatedAt) VALUES (?, ?, ?, ?, ?, ?)`,
+		"outer", "free-tier", "fallback", string(outerModels), "2026-07-19T00:00:00Z", "2026-07-19T00:00:00Z")
+
+	// resolveModelEntry("free-tier") should resolve via nested combo.
+	info := h.resolveModelEntry("free-tier")
+	if info == nil {
+		t.Fatal("expected non-nil for nested combo name")
+	}
+	if info.Provider != "deepseek" {
+		t.Errorf("expected provider 'deepseek', got %s", info.Provider)
+	}
+	if len(info.ComboModels) != 2 {
+		t.Errorf("expected 2 combo models, got %d", len(info.ComboModels))
+	}
+	if info.ComboModels[0] != "inner-combo" {
+		t.Errorf("expected first combo model 'inner-combo', got %s", info.ComboModels[0])
+	}
+}
+
+func TestResolveModelEntry_AliasResolved(t *testing.T) {
+	database, cleanup := setupChatTestDB(t)
+	defer cleanup()
+	repo := db.NewRepo(database)
+	h := NewChatHandler(repo)
+
+	// "ds" is an alias for "deepseek"
+	info := h.resolveModelEntry("ds/deepseek-chat")
+	if info == nil {
+		t.Fatal("expected non-nil ModelInfo for aliased provider")
+	}
+	if info.Provider != "deepseek" {
+		t.Errorf("expected provider 'deepseek' after alias resolution, got %s", info.Provider)
+	}
+}
+
+func TestResolvePrefixProvider_ResolvesConnection(t *testing.T) {
+	database, cleanup := setupChatTestDB(t)
+	defer cleanup()
+
+	nodeData := `{"prefix":"bn","apiType":"openai-compatible","baseUrl":"https://bn.example.com/v1/chat/completions"}`
+	_, err := database.Exec(`INSERT INTO providerNodes (id, type, name, data, createdAt, updatedAt) VALUES
+		('openai-compatible-chat-bn', 'openai-compatible', 'Bun Node', ?, '2026-07-18T00:00:00Z', '2026-07-18T00:00:00Z')`, nodeData)
+	if err != nil {
+		t.Fatalf("seed providerNode: %v", err)
+	}
+
+	connData, _ := json.Marshal(map[string]any{"apiKey": "sk-bn"})
+	_, err = database.Exec(`INSERT INTO providerConnections (id, provider, authType, name, priority, isActive, data, createdAt, updatedAt) VALUES
+		('conn-bn', 'openai-compatible-chat-bn', 'apikey', 'Bun', 1, 1, ?, '2026-07-18T00:00:00Z', '2026-07-18T00:00:00Z')`, string(connData))
+	if err != nil {
+		t.Fatalf("seed connection: %v", err)
+	}
+
+	repo := db.NewRepo(database)
+	h := NewChatHandler(repo)
+
+	info := h.resolvePrefixProvider("bn", "claude-sonnet-4.5")
+	if info == nil {
+		t.Fatal("expected non-nil ModelInfo for prefix provider")
+	}
+	if info.Provider != "openai-compatible-chat-bn" {
+		t.Errorf("expected provider node id, got %s", info.Provider)
+	}
+	if info.ConnectionID != "conn-bn" {
+		t.Errorf("expected pinned connection id, got %s", info.ConnectionID)
+	}
+}
+
+func TestResolveModel_CustomPrefixShadowing_BuiltinAlias(t *testing.T) {
+	database, cleanup := setupChatTestDB(t)
+	defer cleanup()
+
+	// Seed custom providerNode with prefix "oa" (collides with builtin alias "oa" -> "openai")
+	oaNodeData := `{"prefix":"oa","apiType":"openai-compatible","baseUrl":"https://custom-oa.example.com/v1"}`
+	_, err := database.Exec(`INSERT INTO providerNodes (id, type, name, data, createdAt, updatedAt) VALUES
+		('openai-compatible-chat-f494', 'openai-compatible', 'Custom OA', ?, '2026-07-18T00:00:00Z', '2026-07-18T00:00:00Z')`, oaNodeData)
+	if err != nil {
+		t.Fatalf("seed providerNode oa: %v", err)
+	}
+
+	// Seed active connection for Custom OA
+	connData, _ := json.Marshal(map[string]any{"apiKey": "sk-custom-oa"})
+	_, err = database.Exec(`INSERT INTO providerConnections (id, provider, authType, name, priority, isActive, data, createdAt, updatedAt) VALUES
+		('conn-custom-oa', 'openai-compatible-chat-f494', 'apikey', 'Custom OA Conn', 1, 1, ?, '2026-07-18T00:00:00Z', '2026-07-18T00:00:00Z')`, string(connData))
+	if err != nil {
+		t.Fatalf("seed connection oa: %v", err)
+	}
+
+	// Seed custom providerNode with prefix "cc" (collides with builtin alias "cc" -> "claude")
+	ccNodeData := `{"prefix":"cc","apiType":"openai-compatible","baseUrl":"https://custom-cc.example.com/v1"}`
+	_, err = database.Exec(`INSERT INTO providerNodes (id, type, name, data, createdAt, updatedAt) VALUES
+		('openai-compatible-chat-cc99', 'openai-compatible', 'Custom CC', ?, '2026-07-18T00:00:00Z', '2026-07-18T00:00:00Z')`, ccNodeData)
+	if err != nil {
+		t.Fatalf("seed providerNode cc: %v", err)
+	}
+	connCCData, _ := json.Marshal(map[string]any{"apiKey": "sk-custom-cc"})
+	_, err = database.Exec(`INSERT INTO providerConnections (id, provider, authType, name, priority, isActive, data, createdAt, updatedAt) VALUES
+		('conn-custom-cc', 'openai-compatible-chat-cc99', 'apikey', 'Custom CC Conn', 1, 1, ?, '2026-07-18T00:00:00Z', '2026-07-18T00:00:00Z')`, string(connCCData))
+	if err != nil {
+		t.Fatalf("seed connection cc: %v", err)
+	}
+
+	repo := db.NewRepo(database)
+	h := NewChatHandler(repo)
+
+	// 1. "oa/deepseek-v4-flash" must route to openai-compatible-chat-f494, NOT "openai"
+	infoOA, err := h.resolveModel("oa/deepseek-v4-flash")
+	if err != nil {
+		t.Fatalf("resolveModel oa error: %v", err)
+	}
+	if infoOA.Provider != "openai-compatible-chat-f494" {
+		t.Errorf("expected provider 'openai-compatible-chat-f494', got %q", infoOA.Provider)
+	}
+	if infoOA.ConnectionID != "conn-custom-oa" {
+		t.Errorf("expected connectionID 'conn-custom-oa', got %q", infoOA.ConnectionID)
+	}
+	if infoOA.Model != "deepseek-v4-flash" {
+		t.Errorf("expected model 'deepseek-v4-flash', got %q", infoOA.Model)
+	}
+
+	// 2. "cc/glm-5.3" must route to openai-compatible-chat-cc99, NOT "claude"
+	infoCC, err := h.resolveModel("cc/glm-5.3")
+	if err != nil {
+		t.Fatalf("resolveModel cc error: %v", err)
+	}
+	if infoCC.Provider != "openai-compatible-chat-cc99" {
+		t.Errorf("expected provider 'openai-compatible-chat-cc99', got %q", infoCC.Provider)
+	}
+	if infoCC.ConnectionID != "conn-custom-cc" {
+		t.Errorf("expected connectionID 'conn-custom-cc', got %q", infoCC.ConnectionID)
+	}
+
+	// 3. Bare alias check "oa" resolves to custom provider node
+	infoBare, err := h.resolveModel("oa")
+	if err != nil {
+		t.Fatalf("resolveModel bare 'oa' error: %v", err)
+	}
+	if infoBare.Provider != "openai-compatible-chat-f494" {
+		t.Errorf("expected bare 'oa' to resolve to custom node, got %q", infoBare.Provider)
+	}
+}
+
+func TestResolveModel_CustomPrefix_NoConnections_ReportsNodeID(t *testing.T) {
+	database, cleanup := setupChatTestDB(t)
+	defer cleanup()
+
+	// Seed custom providerNode with prefix "oa", but NO connections anywhere
+	oaNodeData := `{"prefix":"oa","apiType":"openai-compatible","baseUrl":"https://custom-oa.example.com/v1"}`
+	_, err := database.Exec(`INSERT INTO providerNodes (id, type, name, data, createdAt, updatedAt) VALUES
+		('openai-compatible-chat-f494', 'openai-compatible', 'Custom OA', ?, '2026-07-18T00:00:00Z', '2026-07-18T00:00:00Z')`, oaNodeData)
+	if err != nil {
+		t.Fatalf("seed providerNode oa: %v", err)
+	}
+
+	repo := db.NewRepo(database)
+	h := NewChatHandler(repo)
+
+	// Since openai has no connections, resolveModel should pin to custom node ID
+	info, err := h.resolveModel("oa/deepseek-v4-flash")
+	if err != nil {
+		t.Fatalf("resolveModel error: %v", err)
+	}
+	if info.Provider != "openai-compatible-chat-f494" {
+		t.Errorf("expected provider 'openai-compatible-chat-f494' (not shadowed 'openai'), got %q", info.Provider)
+	}
+}
+
+func TestResolvePrefixProvider_UnknownPrefixReturnsNil(t *testing.T) {
+	database, cleanup := setupChatTestDB(t)
+	defer cleanup()
+	repo := db.NewRepo(database)
+	h := NewChatHandler(repo)
+
+	if info := h.resolvePrefixProvider("zzz-unknown", "model"); info != nil {
+		t.Errorf("expected nil for unknown prefix, got %+v", info)
+	}
+}
+
+func TestResolveModel_CommonProviderFallback(t *testing.T) {
+	database, cleanup := setupChatTestDB(t)
+	defer cleanup()
+	repo := db.NewRepo(database)
+	h := NewChatHandler(repo)
+
+	// "deepseek-chat" has no slash/alias/combo, but deepseek has a seeded connection.
+	info, err := h.resolveModel("deepseek-chat")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if info.Provider != "deepseek" || info.Model != "deepseek-chat" {
+		t.Errorf("expected deepseek/deepseek-chat via common-provider fallback, got %s/%s", info.Provider, info.Model)
+	}
+}
+
+func TestResolveModel_ComboWithNestedComboName(t *testing.T) {
+	database, cleanup := setupChatTestDB(t)
+	defer cleanup()
+	repo := db.NewRepo(database)
+	h := NewChatHandler(repo)
+
+	// Inner combo: "inner-only" → deepseek/deepseek-chat
+	innerModels, _ := json.Marshal([]string{"deepseek/deepseek-chat"})
+	database.Exec(`INSERT INTO combos (id, name, kind, models, createdAt, updatedAt) VALUES (?, ?, ?, ?, ?, ?)`,
+		"in1", "inner-only", "fallback", string(innerModels), "2026-07-19T00:00:00Z", "2026-07-19T00:00:00Z")
+
+	// Outer combo: "combo-wombo" → ["inner-only", "deepseek/deepseek-chat"]
+	outerModels, _ := json.Marshal([]string{"inner-only", "deepseek/deepseek-chat"})
+	database.Exec(`INSERT INTO combos (id, name, kind, models, createdAt, updatedAt) VALUES (?, ?, ?, ?, ?, ?)`,
+		"out1", "combo-wombo", "fallback", string(outerModels), "2026-07-19T00:00:00Z", "2026-07-19T00:00:00Z")
+
+	info, err := h.resolveModel("combo-wombo")
+	if err != nil {
+		t.Fatalf("expected no error, got %v", err)
+	}
+	if info.Provider != "deepseek" {
+		t.Errorf("expected provider 'deepseek', got %s", info.Provider)
+	}
+	if info.Model != "deepseek-chat" {
+		t.Errorf("expected model 'deepseek-chat', got %s", info.Model)
+	}
+	if len(info.ComboModels) != 1 || info.ComboModels[0] != "deepseek/deepseek-chat" {
+		t.Errorf("expected flattened [deepseek/deepseek-chat], got %v", info.ComboModels)
+	}
+}
+
+func TestFlattenComboModels_ExpandsNested(t *testing.T) {
+	database, cleanup := setupChatTestDB(t)
+	defer cleanup()
+	repo := db.NewRepo(database)
+	h := NewChatHandler(repo)
+
+	inner, _ := json.Marshal([]string{"oc/ling-3.0-flash-free", "gemini/gemini-3.5-flash"})
+	database.Exec(`INSERT INTO combos (id, name, kind, models, createdAt, updatedAt) VALUES (?, ?, ?, ?, ?, ?)`,
+		"ft1", "free-tier", "fallback", string(inner), "2026-07-19T00:00:00Z", "2026-07-19T00:00:00Z")
+
+	flat, err := h.flattenComboModels([]string{"free-tier", "openai/gpt-4"})
+	if err != nil {
+		t.Fatalf("flatten error: %v", err)
+	}
+	want := []string{"oc/ling-3.0-flash-free", "gemini/gemini-3.5-flash", "openai/gpt-4"}
+	if len(flat) != len(want) {
+		t.Fatalf("expected %d models, got %d: %v", len(want), len(flat), flat)
+	}
+	for i := range want {
+		if flat[i] != want[i] {
+			t.Errorf("expected %v, got %v", want, flat)
+			break
+		}
+	}
+}
+
+func TestFlattenComboModels_DeeplyNested(t *testing.T) {
+	database, cleanup := setupChatTestDB(t)
+	defer cleanup()
+	repo := db.NewRepo(database)
+	h := NewChatHandler(repo)
+
+	// base-combo -> ["ag/gemini-3.7-flash-high", "ag/gemini-pro-agent"]
+	base, _ := json.Marshal([]string{"ag/gemini-3.7-flash-high", "ag/gemini-pro-agent"})
+	database.Exec(`INSERT INTO combos (id, name, kind, models, createdAt, updatedAt) VALUES (?, ?, ?, ?, ?, ?)`,
+		"c-base", "base-combo", "fallback", string(base), "2026-07-19T00:00:00Z", "2026-07-19T00:00:00Z")
+
+	// mid-combo -> ["base-combo", "oc/deepseek-v4-flash-free"]
+	mid, _ := json.Marshal([]string{"base-combo", "oc/deepseek-v4-flash-free"})
+	database.Exec(`INSERT INTO combos (id, name, kind, models, createdAt, updatedAt) VALUES (?, ?, ?, ?, ?, ?)`,
+		"c-mid", "mid-combo", "fallback", string(mid), "2026-07-19T00:00:00Z", "2026-07-19T00:00:00Z")
+
+	// super-combo -> ["mid-combo", "openai/gpt-4o"]
+	flat, err := h.flattenComboModels([]string{"mid-combo", "openai/gpt-4o"})
+	if err != nil {
+		t.Fatalf("flatten error: %v", err)
+	}
+
+	want := []string{"ag/gemini-3.7-flash-high", "ag/gemini-pro-agent", "oc/deepseek-v4-flash-free", "openai/gpt-4o"}
+	if len(flat) != len(want) {
+		t.Fatalf("expected %d models, got %d: %v", len(want), len(flat), flat)
+	}
+	for i := range want {
+		if flat[i] != want[i] {
+			t.Errorf("at index %d: expected %q, got %q", i, want[i], flat[i])
+		}
+	}
+}
+
+func TestFlattenComboModels_DedupesConsecutive(t *testing.T) {
+	database, cleanup := setupChatTestDB(t)
+	defer cleanup()
+	repo := db.NewRepo(database)
+	h := NewChatHandler(repo)
+
+	inner, _ := json.Marshal([]string{"deepseek/deepseek-chat"})
+	database.Exec(`INSERT INTO combos (id, name, kind, models, createdAt, updatedAt) VALUES (?, ?, ?, ?, ?, ?)`,
+		"in1", "inner-only", "fallback", string(inner), "2026-07-19T00:00:00Z", "2026-07-19T00:00:00Z")
+
+	// ["inner-only", "deepseek/deepseek-chat"] both expand to the same leaf.
+	flat, err := h.flattenComboModels([]string{"inner-only", "deepseek/deepseek-chat"})
+	if err != nil {
+		t.Fatalf("flatten error: %v", err)
+	}
+	if len(flat) != 1 || flat[0] != "deepseek/deepseek-chat" {
+		t.Errorf("expected [deepseek/deepseek-chat], got %v", flat)
+	}
+}
+
+func TestFlattenComboModels_Cycle(t *testing.T) {
+	database, cleanup := setupChatTestDB(t)
+	defer cleanup()
+	repo := db.NewRepo(database)
+	h := NewChatHandler(repo)
+
+	a, _ := json.Marshal([]string{"combo-b"})
+	b, _ := json.Marshal([]string{"combo-a"})
+	database.Exec(`INSERT INTO combos (id, name, kind, models, createdAt, updatedAt) VALUES (?, ?, ?, ?, ?, ?)`,
+		"ca", "combo-a", "fallback", string(a), "2026-07-19T00:00:00Z", "2026-07-19T00:00:00Z")
+	database.Exec(`INSERT INTO combos (id, name, kind, models, createdAt, updatedAt) VALUES (?, ?, ?, ?, ?, ?)`,
+		"cb", "combo-b", "fallback", string(b), "2026-07-19T00:00:00Z", "2026-07-19T00:00:00Z")
+
+	if _, err := h.flattenComboModels([]string{"combo-a"}); err == nil {
+		t.Fatal("expected cycle error when no concrete models remain")
+	}
+}
+
+func TestFlattenComboModels_GracefulCycleRecovery(t *testing.T) {
+	database, cleanup := setupChatTestDB(t)
+	defer cleanup()
+	repo := db.NewRepo(database)
+	h := NewChatHandler(repo)
+
+	// combo-self contains ["combo-self", "antigravity/gemini-3.7-flash"]
+	selfList, _ := json.Marshal([]string{"combo-self", "antigravity/gemini-3.7-flash"})
+	database.Exec(`INSERT INTO combos (id, name, kind, models, createdAt, updatedAt) VALUES (?, ?, ?, ?, ?, ?)`,
+		"cself", "combo-self", "fallback", string(selfList), "2026-07-19T00:00:00Z", "2026-07-19T00:00:00Z")
+
+	flat, err := h.flattenComboModels([]string{"combo-self"})
+	if err != nil {
+		t.Fatalf("expected graceful cycle recovery, got error: %v", err)
+	}
+
+	if len(flat) != 1 || flat[0] != "antigravity/gemini-3.7-flash" {
+		t.Fatalf("expected [antigravity/gemini-3.7-flash], got %v", flat)
+	}
+}
+
+func TestResolveModel_UnresolvableReturnsError(t *testing.T) {
+	// Use a DB with NO provider connections at all so the common-provider
+	// fallback loop finds nothing and resolution genuinely fails.
+	database, cleanup := setupChatTestDB(t)
+	defer cleanup()
+	// Remove the seeded deepseek/groq connections so no fallback provider matches.
+	if _, err := database.Exec(`DELETE FROM providerConnections`); err != nil {
+		t.Fatalf("delete connections: %v", err)
+	}
+	// Also clear aliases/combos that could resolve the bare model.
+	if _, err := database.Exec(`DELETE FROM kv WHERE scope='modelAliases'`); err != nil {
+		t.Fatalf("delete aliases: %v", err)
+	}
+	if _, err := database.Exec(`DELETE FROM combos`); err != nil {
+		t.Fatalf("delete combos: %v", err)
+	}
+
+	repo := db.NewRepo(database)
+	h := NewChatHandler(repo)
+
+	_, err := h.resolveModel("gemini-unknown-model")
+	if err == nil {
+		t.Error("expected error for unresolvable model with no connections")
+	}
+}
+
+func TestResolveModel_BareCodexAutoReview(t *testing.T) {
+	database, cleanup := setupChatTestDB(t)
+	defer cleanup()
+	repo := db.NewRepo(database)
+	h := NewChatHandler(repo)
+
+	info, err := h.resolveModel("codex-auto-review")
+	if err != nil {
+		t.Fatalf("expected codex-auto-review to resolve, got error: %v", err)
+	}
+	if info.Provider != "codex" || info.Model != "codex-auto-review" {
+		t.Errorf("expected Provider=codex, Model=codex-auto-review, got Provider=%s, Model=%s", info.Provider, info.Model)
+	}
+}
+
+func TestResolveModel_StandardPrefixes(t *testing.T) {
+	database, cleanup := setupChatTestDB(t)
+	defer cleanup()
+	repo := db.NewRepo(database)
+	h := NewChatHandler(repo)
+
+	// oc/ prefix resolves to opencode
+	info1, err := h.resolveModel("oc/space-bunny-free")
+	if err != nil {
+		t.Fatalf("expected oc/space-bunny-free to resolve, got error: %v", err)
+	}
+	if info1.Provider != "opencode" || info1.Model != "space-bunny-free" {
+		t.Errorf("expected Provider=opencode, Model=space-bunny-free, got %+v", info1)
+	}
+
+	// ag/ prefix resolves to antigravity
+	info2, err := h.resolveModel("ag/gemini-3.8-flash-high")
+	if err != nil {
+		t.Fatalf("expected ag/gemini-3.8-flash-high to resolve, got error: %v", err)
+	}
+	if info2.Provider != "antigravity" || info2.Model != "gemini-3.8-flash-high" {
+		t.Errorf("expected Provider=antigravity, Model=gemini-3.8-flash-high, got %+v", info2)
+	}
+
+	// antigravity/ prefix resolves to antigravity
+	info3, err := h.resolveModel("antigravity/gemini-3.8-flash")
+	if err != nil {
+		t.Fatalf("expected antigravity/gemini-3.8-flash to resolve, got error: %v", err)
+	}
+	if info3.Provider != "antigravity" || info3.Model != "gemini-3.8-flash" {
+		t.Errorf("expected Provider=antigravity, Model=gemini-3.8-flash, got %+v", info3)
+	}
+}
+
+func TestResolveModel_StrictProviderIsolation(t *testing.T) {
+	database, cleanup := setupChatTestDB(t)
+	defer cleanup()
+	h := NewChatHandler(db.NewRepo(database))
+
+	// ag/ prefix must strictly resolve to antigravity, never hijack to opencode
+	info, err := h.resolveModel("ag/muse-spark-1.3-contributor-free")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if info.Provider != "antigravity" || info.Model != "muse-spark-1.3-contributor-free" {
+		t.Fatalf("expected antigravity/muse-spark-1.3-contributor-free, got %s/%s", info.Provider, info.Model)
+	}
+
+	// resolveModelEntryGuarded is the path the six combo callers use; without
+	// this the routing fix was only covered through resolveModel.
+	entry := h.resolveModelEntry("ag/muse-spark-1.3-contributor-free")
+	if entry == nil || entry.Provider != "antigravity" {
+		t.Fatalf("resolveModelEntry: expected antigravity, got %+v", entry)
+	}
+}
+
+// A cursor preset seeds a combo named after the bare model id (`gpt-5.3-codex`
+// -> ["cu/gpt-5.3-codex"]), and the catalog serves that preset by name. The
+// Codex-only slug rule used to run before the combo lookup, so a request for
+// that bare id resolved to provider `codex` and the combo was never consulted —
+// the preset was offered and unrouteable at the same time.
+//
+// Upstream puts the combo lookup ahead of the prefix inference
+// (src/sse/services/model.js getModelInfo -> getComboByName first), so a stored
+// combo of that name owns the bare id.
+func TestResolveModel_ComboWinsOverCodexSlugInference(t *testing.T) {
+	database, cleanup := setupChatTestDB(t)
+	defer cleanup()
+	repo := db.NewRepo(database)
+	h := NewChatHandler(repo)
+
+	// Exactly what POST /api/combos/presets writes for the two cursor presets
+	// that carry a codex-only slug.
+	for _, id := range []string{"gpt-5.2-codex", "gpt-5.3-codex"} {
+		models, _ := json.Marshal([]string{"cu/" + id})
+		if _, err := database.Exec(`INSERT INTO combos (id, name, kind, models, createdAt, updatedAt) VALUES (?, ?, ?, ?, ?, ?)`,
+			"cu-"+id, id, "fallback", string(models), "2026-10-23T00:00:00Z", "2026-10-23T00:00:00Z"); err != nil {
+			t.Fatalf("seed combo %q: %v", id, err)
+		}
+	}
+
+	for _, id := range []string{"gpt-5.2-codex", "gpt-5.3-codex"} {
+		t.Run(id, func(t *testing.T) {
+			info, err := h.resolveModel(id)
+			if err != nil {
+				t.Fatalf("resolveModel(%q) error = %v", id, err)
+			}
+			if len(info.ComboModels) != 1 || info.ComboModels[0] != "cu/"+id {
+				t.Fatalf("resolveModel(%q) = %+v, want the combo [cu/%s] to be consulted", id, info, id)
+			}
+			if info.Provider != "cursor" {
+				t.Errorf("resolveModel(%q).Provider = %q, want cursor (the combo's first leaf), not the codex inference", id, info.Provider)
+			}
+		})
+	}
+}
+
+// The slug rule still owns a bare id when no combo claims it: the fix moves the
+// combo lookup ahead of the rule, it does not remove the rule.
+func TestResolveModel_CodexSlugStillResolvesWithoutCombo(t *testing.T) {
+	database, cleanup := setupChatTestDB(t)
+	defer cleanup()
+	h := NewChatHandler(db.NewRepo(database))
+
+	info, err := h.resolveModel("gpt-5.3-codex")
+	if err != nil {
+		t.Fatalf("resolveModel error = %v", err)
+	}
+	if info.Provider != "codex" || info.Model != "gpt-5.3-codex" {
+		t.Errorf("got %s/%s, want codex/gpt-5.3-codex", info.Provider, info.Model)
+	}
+	if len(info.ComboModels) != 0 {
+		t.Errorf("ComboModels = %v, want none", info.ComboModels)
+	}
+}
+
+func TestResolveModel_WebComboBareProviderNames(t *testing.T) {
+	database, cleanup := setupChatTestDB(t)
+	defer cleanup()
+	h := NewChatHandler(db.NewRepo(database))
+
+	// WebSearch combo with legacy bare provider names
+	searchModels, _ := json.Marshal([]string{"exa", "serper", "tavily"})
+	kindSearch := "webSearch"
+	_, err := database.Exec(`INSERT INTO combos (id, name, kind, models, createdAt, updatedAt) VALUES (?, ?, ?, ?, ?, ?)`,
+		"c-search", "my-search-combo", kindSearch, string(searchModels), "2026-11-04T00:00:00Z", "2026-11-04T00:00:00Z")
+	if err != nil {
+		t.Fatalf("insert search combo: %v", err)
+	}
+
+	info, err := h.resolveModel("my-search-combo")
+	if err != nil {
+		t.Fatalf("resolveModel(my-search-combo) error = %v", err)
+	}
+	wantSearch := []string{"exa/search", "serper/search", "tavily/search"}
+	if len(info.ComboModels) != len(wantSearch) {
+		t.Fatalf("got %d ComboModels, want %d: %v", len(info.ComboModels), len(wantSearch), info.ComboModels)
+	}
+	for i := range wantSearch {
+		if info.ComboModels[i] != wantSearch[i] {
+			t.Errorf("at index %d: expected %q, got %q", i, wantSearch[i], info.ComboModels[i])
+		}
+	}
+
+	// WebFetch combo with legacy bare provider names
+	fetchModels, _ := json.Marshal([]string{"exa", "firecrawl"})
+	kindFetch := "webFetch"
+	_, err = database.Exec(`INSERT INTO combos (id, name, kind, models, createdAt, updatedAt) VALUES (?, ?, ?, ?, ?, ?)`,
+		"c-fetch", "my-fetch-combo", kindFetch, string(fetchModels), "2026-11-04T00:00:00Z", "2026-11-04T00:00:00Z")
+	if err != nil {
+		t.Fatalf("insert fetch combo: %v", err)
+	}
+
+	fetchInfo, err := h.resolveModel("my-fetch-combo")
+	if err != nil {
+		t.Fatalf("resolveModel(my-fetch-combo) error = %v", err)
+	}
+	wantFetch := []string{"exa/fetch", "firecrawl/fetch"}
+	if len(fetchInfo.ComboModels) != len(wantFetch) {
+		t.Fatalf("got %d ComboModels, want %d: %v", len(fetchInfo.ComboModels), len(wantFetch), fetchInfo.ComboModels)
+	}
+	for i := range wantFetch {
+		if fetchInfo.ComboModels[i] != wantFetch[i] {
+			t.Errorf("at index %d: expected %q, got %q", i, wantFetch[i], fetchInfo.ComboModels[i])
+		}
+	}
+}
+
+func TestIsCopilotResponsesModel(t *testing.T) {
+	cases := []struct {
+		model string
+		want  bool
+	}{
+		{"gpt-6.1-terra", true},
+		{"gpt-6-terra", true},
+		{"gpt-5.5", true},
+		{"gpt-5.6-sol", true},
+		{"github/gpt-6.1-terra", true},
+		{"gpt-6.1-terra(high)", true},
+		{"gpt-5", false},
+		{"gpt-6", false},
+		{"gpt-5.4", false},
+		{"gpt-4o", false},
+		{"claude-sonnet-4-5", false},
+		{"", false},
+	}
+	for _, tc := range cases {
+		got := isCopilotResponsesModel("github", tc.model)
+		if got != tc.want {
+			t.Errorf("isCopilotResponsesModel(github, %q) = %v, want %v", tc.model, got, tc.want)
+		}
+	}
+}
+
+func TestResolveModelEntry_ConnectionNameAndIDPrefix(t *testing.T) {
+	database, cleanup := setupChatTestDB(t)
+	defer cleanup()
+
+	now := time.Now().UTC().Format(time.RFC3339)
+	connData, _ := json.Marshal(map[string]any{"apiKey": "vibe-key-123"})
+	_, err := database.Exec(`INSERT INTO providerConnections (id, provider, authType, name, priority, isActive, data, createdAt, updatedAt) VALUES
+		('conn-mistral-vibe', 'mistral', 'apikey', 'Mistral Vibe', 1, 1, ?, ?, ?)`, string(connData), now, now)
+	if err != nil {
+		t.Fatalf("seed vibe connection: %v", err)
+	}
+
+	apiConnData, _ := json.Marshal(map[string]any{"apiKey": "api-key-456"})
+	_, err = database.Exec(`INSERT INTO providerConnections (id, provider, authType, name, priority, isActive, data, createdAt, updatedAt) VALUES
+		('conn-mistral-api', 'mistral', 'apikey', 'Mistral API', 2, 1, ?, ?, ?)`, string(apiConnData), now, now)
+	if err != nil {
+		t.Fatalf("seed api connection: %v", err)
+	}
+
+	h := NewChatHandler(db.NewRepo(database))
+
+	tests := []struct {
+		entry          string
+		wantProvider   string
+		wantModel      string
+		wantConnection string
+	}{
+		{"Mistral Vibe/codestral-latest", "mistral", "codestral-latest", "conn-mistral-vibe"},
+		{"mistral-vibe/codestral-latest", "mistral", "codestral-latest", "conn-mistral-vibe"},
+		{"conn-mistral-vibe/codestral-latest", "mistral", "codestral-latest", "conn-mistral-vibe"},
+		{"Mistral API/codestral-latest", "mistral", "codestral-latest", "conn-mistral-api"},
+		{"mistral-api/codestral-latest", "mistral", "codestral-latest", "conn-mistral-api"},
+		{"mistral/codestral-latest", "mistral", "codestral-latest", ""},
+	}
+
+	// Verify connection name cannot shadow a provider or alias (e.g. connection named "deepseek")
+	dsConnData, _ := json.Marshal(map[string]any{"apiKey": "ds-key"})
+	_, err = database.Exec(`INSERT INTO providerConnections (id, provider, authType, name, priority, isActive, data, createdAt, updatedAt) VALUES
+		('conn-ds', 'openai', 'apikey', 'deepseek', 3, 1, ?, ?, ?)`, string(dsConnData), now, now)
+	if err != nil {
+		t.Fatalf("seed deepseek connection: %v", err)
+	}
+
+	tests = append(tests, struct {
+		entry          string
+		wantProvider   string
+		wantModel      string
+		wantConnection string
+	}{
+		"deepseek/deepseek-chat", "deepseek", "deepseek-chat", "",
+	})
+
+	for _, tc := range tests {
+		t.Run(tc.entry, func(t *testing.T) {
+			got := h.resolveModelEntry(tc.entry)
+			if got == nil {
+				t.Fatalf("resolveModelEntry(%q) = nil, want provider %s", tc.entry, tc.wantProvider)
+			}
+			if got.Provider != tc.wantProvider {
+				t.Errorf("Provider = %q, want %q", got.Provider, tc.wantProvider)
+			}
+			if got.Model != tc.wantModel {
+				t.Errorf("Model = %q, want %q", got.Model, tc.wantModel)
+			}
+			if got.ConnectionID != tc.wantConnection {
+				t.Errorf("ConnectionID = %q, want %q", got.ConnectionID, tc.wantConnection)
+			}
+		})
+	}
+}
+
+func TestResolveModel_BareClaudeFallbackToOAuth(t *testing.T) {
+	database, cleanup := setupChatTestDB(t)
+	defer cleanup()
+	repo := db.NewRepo(database)
+	h := NewChatHandler(repo)
+
+	// 1. Keeps provider anthropic when nothing is connected
+	info, err := h.resolveModel("claude-sonnet-5-5")
+	if err != nil {
+		t.Fatalf("resolveModel error: %v", err)
+	}
+	if info.Provider != "anthropic" || info.Model != "claude-sonnet-5-5" {
+		t.Errorf("got %s/%s, want anthropic/claude-sonnet-5-5", info.Provider, info.Model)
+	}
+
+	// 2. Uses Claude OAuth connection when no anthropic connection is active
+	now := time.Now().UTC().Format(time.RFC3339)
+	claudeData, _ := json.Marshal(map[string]any{"accessToken": "sk-ant-oat-test"})
+	_, err = database.Exec(`INSERT INTO providerConnections (id, provider, authType, name, priority, isActive, data, createdAt, updatedAt) VALUES
+		('c1', 'claude', 'oauth', 'Claude OAuth', 1, 1, ?, ?, ?)`, string(claudeData), now, now)
+	if err != nil {
+		t.Fatalf("seed claude connection: %v", err)
+	}
+
+	info, err = h.resolveModel("claude-sonnet-5-5")
+	if err != nil {
+		t.Fatalf("resolveModel error: %v", err)
+	}
+	if info.Provider != "claude" || info.Model != "claude-sonnet-5-5" {
+		t.Errorf("got %s/%s, want claude/claude-sonnet-5-5", info.Provider, info.Model)
+	}
+
+	// 3. Keeps anthropic when an anthropic connection is active
+	anthropicData, _ := json.Marshal(map[string]any{"apiKey": "sk-ant-api-test"})
+	_, err = database.Exec(`INSERT INTO providerConnections (id, provider, authType, name, priority, isActive, data, createdAt, updatedAt) VALUES
+		('a1', 'anthropic', 'apikey', 'Anthropic API', 1, 1, ?, ?, ?)`, string(anthropicData), now, now)
+	if err != nil {
+		t.Fatalf("seed anthropic connection: %v", err)
+	}
+
+	info, err = h.resolveModel("claude-sonnet-5-5")
+	if err != nil {
+		t.Fatalf("resolveModel error: %v", err)
+	}
+	if info.Provider != "anthropic" || info.Model != "claude-sonnet-5-5" {
+		t.Errorf("got %s/%s, want anthropic/claude-sonnet-5-5", info.Provider, info.Model)
+	}
+
+	// 4. Does not touch an explicit provider prefix
+	info, err = h.resolveModel("anthropic/claude-sonnet-5-5")
+	if err != nil {
+		t.Fatalf("resolveModel error: %v", err)
+	}
+	if info.Provider != "anthropic" || info.Model != "claude-sonnet-5-5" {
+		t.Errorf("got %s/%s, want anthropic/claude-sonnet-5-5", info.Provider, info.Model)
+	}
+}
+
+func BenchmarkResolveModelEntry(b *testing.B) {
+	database, cleanup := setupChatTestDB(b)
+	defer cleanup()
+	now := time.Now().UTC().Format(time.RFC3339)
+	connData, _ := json.Marshal(map[string]any{"apiKey": "key-123"})
+	for i := 0; i < 60; i++ {
+		_, _ = database.Exec(`INSERT INTO providerConnections (id, provider, authType, name, priority, isActive, data, createdAt, updatedAt) VALUES (?, 'mistral', 'apikey', ?, ?, 1, ?, ?, ?)`,
+			fmt.Sprintf("conn-%d", i), fmt.Sprintf("Mistral Conn %d", i), i+1, string(connData), now, now)
+	}
+	h := NewChatHandler(db.NewRepo(database))
+	b.ResetTimer()
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		_ = h.resolveModelEntry("mistral/codestral-latest")
+	}
+}

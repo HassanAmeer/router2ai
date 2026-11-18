@@ -1,0 +1,465 @@
+package chat
+
+import (
+	json "9router/proxy/internal/fastjson"
+	"bytes"
+	"context"
+	"errors"
+	"fmt"
+	"io"
+	"net/http"
+	"strings"
+	"time"
+
+	"9router/proxy/internal/handlerutil"
+	"9router/proxy/internal/jsonfence"
+	"9router/proxy/internal/log"
+	"9router/proxy/internal/middleware"
+	internalproxy "9router/proxy/internal/proxy"
+	"9router/proxy/internal/proxy/executor"
+	"9router/proxy/internal/thinking"
+	"9router/proxy/internal/translator"
+)
+
+// responsesEndpoint labels the client-facing endpoint in usage logs.
+const responsesEndpoint = "/v1/responses"
+
+// forwardEndpoint labels the client-facing endpoint in usage logs and decides
+// whether an Anthropic upstream is fed a native Messages body. A Responses
+// client is not a Claude one, so it must never be labelled /v1/messages.
+func forwardEndpoint(ctx context.Context, claudeClient string) string {
+	if translator.IsResponsesClient(ctx) {
+		return responsesEndpoint
+	}
+	return claudeClient
+}
+
+// newResponsesBridge builds a Chat→Responses bridge that writes through an
+// already-committed SSE writer. Producers that translate upstream into OpenAI
+// chunks on the way out — the Claude and Gemini paths — hand their finished
+// frames to it instead of writing them raw, so a /v1/responses client is served
+// correctly no matter which translation produced the Chat shape.
+func newResponsesBridge(ctx context.Context, hw *internalproxy.HeartbeatWriter, flusher http.Flusher, metrics *streamMetrics, start time.Time) *executor.ResponsesBridge {
+	return executor.NewResponsesBridge(
+		translator.RequestedModelFromContext(ctx),
+		translator.CustomToolNamesFrom(ctx),
+		func(frame []byte) error {
+			frame = SanitizeResponsesNullUsage(frame)
+			if metrics != nil {
+				if metrics.TTFT == 0 {
+					metrics.TTFT = time.Since(start).Milliseconds()
+				}
+				metrics.ResponseBuf.Write(frame)
+			}
+			if _, err := hw.Write(frame); err != nil {
+				return err
+			}
+			if flusher != nil {
+				flusher.Flush()
+			}
+			return nil
+		},
+	)
+}
+
+// HandleResponses handles POST /v1/responses (OpenAI Responses API clients).
+//
+// It is the mirror image of HandleMessages: the client speaks Responses while
+// the upstream may only speak Chat Completions, so the request is converted on
+// the way in and the response is converted back on the way out. The wire format
+// the client uses travels on the context, because the executors are the layer
+// that has to know it and threading a new bool through every request struct
+// would touch five call sites for a single flag.
+func (h *ChatHandler) HandleResponses(w http.ResponseWriter, r *http.Request) {
+	w = newResponsesSanitizingWriter(w)
+	body, err := io.ReadAll(r.Body)
+	if err != nil {
+		log.Error("chat", "read body failed", "error", err)
+		middleware.WriteBodyReadError(w, r, err)
+		return
+	}
+	defer r.Body.Close()
+
+	var reqBody struct {
+		Model  string `json:"model"`
+		Stream bool   `json:"stream"`
+	}
+	if err := json.Unmarshal(body, &reqBody); err != nil {
+		log.Error("chat", "parse JSON failed", "error", err)
+		handlerutil.WriteJSONError(w, http.StatusBadRequest, "invalid JSON body")
+		return
+	}
+	// A "(level)" suffix is a request override, not part of the model id: it
+	// comes off the name before the name is resolved against the aliases and
+	// the combos, and the intent it carries travels on the context.
+	modelName, suffixIntent := thinking.ParseSuffix(reqBody.Model)
+
+	if reqBody.Model == "" {
+		handlerutil.WriteJSONError(w, http.StatusBadRequest, "missing model")
+		return
+	}
+
+	// Per-key model policy: 403 before the responses bridge or any connection
+	// selection.
+	if !h.enforceModelAccess(w, r, modelName) {
+		return
+	}
+	modelInfo, err := h.resolveModel(modelName)
+	if err != nil {
+		log.Error("chat", "resolve model failed", "error", err, "model", reqBody.Model)
+		handlerutil.WriteJSONError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
+	ctx := thinking.WithSuffixIntent(h.newResponsesContext(r, modelName, modelInfo, &body), suffixIntent)
+	// X-9Router-Token-Saver: off|0|false|bypass opts the whole request out of
+	// every token saver; the flag travels on ctx to applyTokenSavers.
+	if isTokenSaverBypassValue(r.Header.Get("X-9Router-Token-Saver")) {
+		ctx = WithTokenSaverBypass(ctx)
+	}
+	// The operator's providerThinking overrides are read once here, not once
+	// per connection attempt.
+	ctx = h.withProviderThinkingModes(ctx)
+
+	var workingBody map[string]any
+	if err := json.Unmarshal(body, &workingBody); err != nil {
+		log.Error("chat", "parse responses body failed", "error", err)
+		handlerutil.WriteJSONError(w, http.StatusBadRequest, "invalid JSON body")
+		return
+	}
+	workingBody["stream"] = reqBody.Stream
+	// A Responses client on a Chat Completions upstream gets its usage back
+	// through the bridge's response.completed, which reads the trailing usage
+	// chunk — asked for here because the Responses dialect has no way to ask
+	// itself. Native Responses upstreams always report usage and are skipped:
+	// no bridge means the body still speaks Responses, where stream_options
+	// is not a field.
+	if reqBody.Stream && translator.NeedsResponsesBridge(ctx) {
+		if _, ok := workingBody["stream_options"]; !ok {
+			workingBody["stream_options"] = map[string]any{"include_usage": true}
+		}
+		if !bytes.Contains(body, []byte(";base64,")) {
+			ctx = translator.WithPromptEstimate(ctx, (len(body)+3)/4)
+		}
+	}
+
+	// The caller's key may carry a context ceiling below the model's own
+	// window. It is applied here, once, so every attempt — single model, combo
+	// member, fusion leg — is trimmed by the same rule.
+	if limit := keyContextLimit(ctx); limit > 0 {
+		modelWindow, modelMaxOutput := modelContextLimits(modelInfo.Provider, modelInfo.Model)
+		trimmed, limitErr := applyKeyContextLimitMap(workingBody, limit, modelWindow, modelMaxOutput)
+		if limitErr != nil {
+			handlerutil.WriteJSONError(w, http.StatusBadRequest, limitErr.Error())
+			return
+		}
+		if trimmed != nil {
+			workingBody = trimmed
+		}
+	}
+
+	requiredCaps := DetectRequiredCapabilities(body)
+
+	if len(modelInfo.ComboModels) > 0 {
+		augmented, comboStrategy, injected := h.applyCapacityAdapter(modelInfo.ComboModels, requiredCaps, modelInfo.Strategy, reqBody.Model, requestKeyID(r))
+		if modelInfo.Strategy == "fusion" {
+			bodyJSON, err := json.Marshal(workingBody)
+			if err != nil {
+				handlerutil.WriteJSONError(w, http.StatusInternalServerError, "failed to marshal request body")
+				return
+			}
+			h.handleFusion(ctx, w, bodyJSON, modelInfo.ComboModels, modelInfo.Strategy, reqBody.Stream, false, reqBody.Model, modelInfo.StickyLimit, modelInfo.JudgeModel)
+			return
+		}
+		h.handleMessagesComboFallback(ctx, w, workingBody, augmented, comboStrategy, reqBody.Stream, reqBody.Model, modelInfo.StickyLimit, injected...)
+		return
+	}
+
+	targetEntry := reqBody.Model
+	if !strings.Contains(targetEntry, "/") && modelInfo.Provider != "" {
+		targetEntry = modelInfo.Provider + "/" + modelInfo.Model
+	}
+	augmented, strat := h.AugmentModelsWithCapacityAdapter([]string{targetEntry}, requiredCaps, requestKeyID(r))
+	if len(augmented) > 1 {
+		injected := augmented[:len(augmented)-1]
+		log.Info("chat", "capacity adapter auto-switch responses", "target", reqBody.Model, "switched_to", augmented[0], "caps", keysString(requiredCaps))
+		h.handleMessagesComboFallback(ctx, w, workingBody, augmented, strat, reqBody.Stream, reqBody.Model, 0, injected...)
+		return
+	}
+
+	h.handleResponsesSingleModel(ctx, w, workingBody, modelInfo, reqBody.Stream)
+}
+
+// newResponsesContext prepares the request context and rewrites body into the
+// format the resolved upstream actually speaks.
+//
+// The native check runs here rather than inside the executor because a combo
+// or a capacity-adapter switch can still land on a different provider than the
+// one resolved above, and a request already converted to Chat Completions
+// cannot travel back to Responses. When the upstream speaks Responses natively
+// nothing is touched at all: upstream makes the same call by skipping
+// translation when the source format already equals the target format.
+func (h *ChatHandler) newResponsesContext(r *http.Request, requestedModel string, modelInfo *ModelInfo, body *[]byte) context.Context {
+	ctx := handlerutil.WithSessionID(r.Context(), handlerutil.ExtractSessionID(r))
+	ctx = executor.WithCodexLiteHeader(ctx, r.Header.Get(executor.CodexResponsesLiteHeader))
+	// Provider-scope limit state, installed where the request's context is built
+	// so every candidate this request tries shares one memory of which providers
+	// were full (docs/provider-limits-plan.md D7).
+	ctx = withProviderLimitState(ctx)
+	ctx = translator.WithClientFormat(ctx, translator.ClientFormatResponses)
+	ctx = translator.WithRequestedModel(ctx, stripModelContextMarker(requestedModel))
+	// The dispatching key decides which guardrail policy governs the response.
+	ctx = withGuardrailKey(ctx, requestKeyID(r))
+	// A Responses client can ask for structured output too; the flag has to be
+	// on the context before the answer is written, and this is where the
+	// request's own body is still in hand.
+	if jsonfence.Wants(*body) {
+		ctx = jsonfence.With(ctx)
+	}
+
+	providerCfg, err := h.getProviderConfig(modelInfo.Provider, nil)
+	if err == nil && executor.UpstreamSpeaksResponses(modelInfo.Provider, modelInfo.Model, providerCfg) {
+		log.Debug("chat", "responses passthrough", "provider", modelInfo.Provider, "model", modelInfo.Model)
+		return ctx
+	}
+
+	converted, err := translator.ResponsesToChatRequest(*body)
+	if err != nil {
+		log.Error("chat", "responses request conversion failed", "error", err)
+		return ctx
+	}
+	if !converted.Converted {
+		return ctx
+	}
+	*body = converted.Body
+	ctx = translator.WithCustomToolNames(ctx, converted.CustomToolNames)
+	return translator.WithResponsesBridge(ctx)
+}
+
+// handleResponsesSingleModel forwards a prepared Responses request for a single
+// model. translateResponse stays false: that flag marks a Claude Messages
+// client, and a Responses client is never one.
+func (h *ChatHandler) handleResponsesSingleModel(ctx context.Context, w http.ResponseWriter, preparedReq map[string]any, modelInfo *ModelInfo, isStream bool) {
+	cw := newCommittedResponseWriter(w)
+	preparedReq["model"] = h.wireModelForNode(modelInfo.Provider, modelInfo.Model)
+	finalBody, err := json.Marshal(preparedReq)
+	if err != nil {
+		handlerutil.WriteJSONError(cw, http.StatusInternalServerError, "failed to marshal responses request")
+		return
+	}
+
+	result := h.handleAccountFallback(ctx, cw, modelInfo.Provider, modelInfo.Model, modelInfo.ConnectionID, finalBody, isStream, false, responsesEndpoint)
+	if result == nil {
+		return
+	}
+	if cw.IsCommitted() {
+		log.Error("chat", "upstream error after headers committed", "error", result)
+		return
+	}
+	var ue *upstreamError
+	if errors.As(result, &ue) {
+		if isStream {
+			var errBody struct {
+				Error map[string]any `json:"error"`
+			}
+			if err := json.Unmarshal(ue.Body, &errBody); err == nil && errBody.Error != nil {
+				if code, _ := errBody.Error["code"].(string); code == "context_length_exceeded" {
+					cw.Header().Set("Content-Type", "text/event-stream")
+					cw.WriteHeader(http.StatusOK)
+					_, _ = cw.Write([]byte(translator.FormatResponsesFailedSSE(errBody.Error)))
+					if f, ok := cw.ResponseWriter.(http.Flusher); ok {
+						f.Flush()
+					}
+					return
+				}
+			}
+		}
+		// Forward only Retry-After, for the same reason /v1/chat/completions
+		// does: it is the one header a caller needs to know when to come back
+		// after a temporary condition. Copying ue.Header wholesale would carry
+		// the failed upstream's framing headers (Content-Length,
+		// Transfer-Encoding) and make the reply advertise a body length that
+		// does not match what is written.
+		if ra := ue.Header.Get("Retry-After"); ra != "" {
+			cw.Header().Set("Retry-After", ra)
+		}
+		cw.Header().Set("Content-Type", "application/json")
+		cw.WriteHeader(ue.StatusCode)
+		cw.Write(ue.Body)
+		return
+	}
+	handlerutil.WriteJSONError(cw, http.StatusBadGateway, fmt.Sprintf("upstream error: %v", result))
+}
+
+// usageTokenFields lists the known token counter field names on Responses API usage objects.
+var usageTokenFields = []string{
+	"total_tokens",
+	"input_tokens",
+	"output_tokens",
+	"prompt_tokens",
+	"completion_tokens",
+	"cached_tokens",
+	"cache_read_input_tokens",
+	"reasoning_tokens",
+}
+
+// SanitizeResponsesNullUsage ensures token count fields in Responses usage objects
+// (e.g. total_tokens, input_tokens, output_tokens) are never emitted as JSON null.
+// When a usage object is present, null token count fields are sanitized to integer 0
+// so typed clients (such as Codex CLI, Rust / typed SDKs) do not fail deserialization.
+func SanitizeResponsesNullUsage(payload []byte) []byte {
+	if len(payload) == 0 || !bytes.Contains(payload, []byte(`"usage"`)) || !bytes.Contains(payload, []byte("null")) {
+		return payload
+	}
+
+	// If payload contains SSE framing ("data:"), sanitize data lines.
+	if bytes.Contains(payload, []byte("data:")) {
+		return sanitizeResponsesSSE(payload)
+	}
+
+	// Otherwise, check for direct JSON object payload.
+	trimmed := bytes.TrimSpace(payload)
+	if len(trimmed) > 0 && trimmed[0] == '{' && trimmed[len(trimmed)-1] == '}' {
+		return sanitizeResponsesJSON(payload)
+	}
+
+	return payload
+}
+
+// sanitizeResponsesJSON unmarshals a JSON object, sanitizes null token fields in any usage map,
+// and returns the re-serialized JSON (or the original bytes if unchanged/unparsable).
+func sanitizeResponsesJSON(raw []byte) []byte {
+	var m map[string]any
+	if err := json.Unmarshal(raw, &m); err != nil {
+		return raw
+	}
+	if !sanitizeUsageInMap(m) {
+		return raw
+	}
+	out, err := json.Marshal(m)
+	if err != nil {
+		return raw
+	}
+	return out
+}
+
+// sanitizeResponsesSSE processes SSE frames line by line, sanitizing data lines that contain usage.
+func sanitizeResponsesSSE(data []byte) []byte {
+	var out bytes.Buffer
+	rest := data
+	changedAny := false
+	for len(rest) > 0 {
+		idx := bytes.IndexByte(rest, '\n')
+		var line []byte
+		if idx >= 0 {
+			line = rest[:idx+1]
+			rest = rest[idx+1:]
+		} else {
+			line = rest
+			rest = nil
+		}
+
+		trimmedLine := bytes.TrimLeft(line, " \t")
+		if bytes.HasPrefix(trimmedLine, []byte("data:")) {
+			payload := bytes.TrimSpace(trimmedLine[len("data:"):])
+			if len(payload) > 0 && payload[0] == '{' && bytes.Contains(payload, []byte(`"usage"`)) && bytes.Contains(payload, []byte("null")) {
+				sanitized := sanitizeResponsesJSON(payload)
+				if !bytes.Equal(sanitized, payload) {
+					changedAny = true
+					lineEnding := "\n"
+					if bytes.HasSuffix(line, []byte("\r\n")) {
+						lineEnding = "\r\n"
+					}
+					out.WriteString("data: ")
+					out.Write(sanitized)
+					out.WriteString(lineEnding)
+					continue
+				}
+			}
+		}
+		out.Write(line)
+	}
+	if !changedAny {
+		return data
+	}
+	return out.Bytes()
+}
+
+// sanitizeUsageInMap checks both top-level "usage" and nested "response" -> "usage".
+func sanitizeUsageInMap(m map[string]any) bool {
+	changed := false
+	if u, ok := m["usage"].(map[string]any); ok && u != nil {
+		if sanitizeUsageObject(u) {
+			changed = true
+		}
+	}
+	if resp, ok := m["response"].(map[string]any); ok && resp != nil {
+		if u, ok := resp["usage"].(map[string]any); ok && u != nil {
+			if sanitizeUsageObject(u) {
+				changed = true
+			}
+		}
+	}
+	return changed
+}
+
+// sanitizeUsageObject replaces any null values in token counter fields with integer 0.
+func sanitizeUsageObject(usage map[string]any) bool {
+	changed := false
+	for _, f := range usageTokenFields {
+		if v, exists := usage[f]; exists && v == nil {
+			usage[f] = 0
+			changed = true
+		}
+	}
+	for k, v := range usage {
+		if v == nil && strings.HasSuffix(k, "_tokens") {
+			usage[k] = 0
+			changed = true
+		}
+	}
+	for _, detailKey := range []string{
+		"input_tokens_details",
+		"output_tokens_details",
+		"prompt_tokens_details",
+		"completion_tokens_details",
+	} {
+		if detailMap, ok := usage[detailKey].(map[string]any); ok && detailMap != nil {
+			for subK, subV := range detailMap {
+				if subV == nil && (strings.HasSuffix(subK, "_tokens") || subK == "cache_read_input_tokens") {
+					detailMap[subK] = 0
+					changed = true
+				}
+			}
+		}
+	}
+	return changed
+}
+
+// responsesSanitizingWriter wraps http.ResponseWriter to sanitize null token counts on response.completed events.
+type responsesSanitizingWriter struct {
+	http.ResponseWriter
+}
+
+func newResponsesSanitizingWriter(w http.ResponseWriter) *responsesSanitizingWriter {
+	return &responsesSanitizingWriter{ResponseWriter: w}
+}
+
+func (rw *responsesSanitizingWriter) Write(b []byte) (int, error) {
+	sanitized := SanitizeResponsesNullUsage(b)
+	n, err := rw.ResponseWriter.Write(sanitized)
+	if err != nil {
+		return n, err
+	}
+	return len(b), nil
+}
+
+func (rw *responsesSanitizingWriter) Flush() {
+	if f, ok := rw.ResponseWriter.(http.Flusher); ok {
+		f.Flush()
+	}
+}
+
+func (rw *responsesSanitizingWriter) Unwrap() http.ResponseWriter {
+	return rw.ResponseWriter
+}
